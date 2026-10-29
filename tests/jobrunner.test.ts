@@ -179,6 +179,32 @@ describe("jobRunner", () => {
     }
   });
 
+  it("maxCalls caps model calls and marks the run partial", async () => {
+    const d5 = makeRepo({ "src/auth.ts": AUTH_TS, "src/util.ts": UTIL_TS });
+    try {
+      let genCalls = 0;
+      const gen: GenerateFn = async () => {
+        genCalls += 1;
+        return `{"findings": []}`;
+      };
+      const r = await runJob({ generate: gen }, d5, { ...basePolicy, maxCalls: 1 });
+      assert.ok(genCalls <= 1, `expected <=1 generate call, got ${genCalls}`);
+      assert.equal(r.partial, true);
+      assert.equal(r.summary.status, "partial");
+    } finally {
+      rmSync(d5, { recursive: true, force: true });
+    }
+  });
+
+  it("no models configured yields a partial handoff with a blind spot", async () => {
+    const gen: GenerateFn = async () => `{"findings": []}`;
+    const r = await runJob({ generate: gen }, dir, { ...basePolicy, models: [] });
+    assert.equal(r.partial, true);
+    assert.ok(r.summary.coverage.blindSpots.some((b) => /no models/i.test(b)));
+    const md = readFileSync(r.handoffPath, "utf8");
+    assert.ok(md.includes("INCOMPLETE"));
+  });
+
   it("total model failure still writes a partial handoff", async () => {
     const d4 = makeRepo({ "src/auth.ts": AUTH_TS, "src/util.ts": UTIL_TS });
     try {

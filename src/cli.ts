@@ -86,8 +86,8 @@ async function cmdRun(repo: string): Promise<number> {
     leadBudget: num("--lead-budget", 200),
     verifyBudget: num("--verify-budget", 50),
     wallMs: num("--wall-minutes", 45) * 60_000,
+    ...(has("--max-calls") ? { maxCalls: num("--max-calls", 0) || undefined } : {}),
   };
-  void num("--max-calls", 0);
   console.log(`audit run ${resolve(repo)} scope=${scope} tier=${tier} models=${models.join(",")}`);
   const result = await runJob({ generate: openRouterGenerate }, repo, policy);
   console.log(`handoff: ${result.handoffPath}`);

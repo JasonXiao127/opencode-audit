@@ -297,6 +297,8 @@ export interface JobPolicy {
   leadBudget?: number;
   verifyBudget?: number;
   wallMs?: number;
+  /** Hard cap on model generate calls (sweep + verify). Hit → partial. */
+  maxCalls?: number;
   promptVersion?: string;
 }
 

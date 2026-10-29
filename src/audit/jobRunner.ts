@@ -132,6 +132,7 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
   const verifyBudget = policy.verifyBudget ?? VERIFY_BUDGET_DEFAULT;
   const perModelMax = policy.perModelMax ?? 3;
   const globalMax = policy.globalMax ?? 12;
+  const maxCalls = policy.maxCalls;
   const models = [...policy.models];
   const tier = policy.tier;
   const scope = policy.scope;
@@ -153,7 +154,7 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
   log.emit({ type: "run.started", models, policy: { ...policy } });
 
   let calls = 0;
-  let partial = false;
+  let partial = models.length === 0;
   const skipped: SkippedFile[] = [];
   const contents = new Map<string, { lines: string[]; text: string }>();
   const finderOf = new Map<string, string>();
@@ -169,6 +170,18 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
   const caps = new Map<string, number>();
 
   const capOf = (m: string): number => caps.get(m) ?? perModelMax;
+  const budgetExceeded = (): boolean => maxCalls !== undefined && calls >= maxCalls;
+
+  /** Reserve one model call against maxCalls. False = budget hit. */
+  const reserveCall = (): boolean => {
+    if (maxCalls === undefined) return true;
+    if (calls >= maxCalls) {
+      partial = true;
+      return false;
+    }
+    calls += 1;
+    return true;
+  };
   const modelUsable = (m: string, now: number): boolean =>
     !retired.has(m) &&
     (cooldownUntil.get(m) ?? 0) <= now &&
@@ -320,6 +333,12 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
       );
       const ref = parseModelKey(u.model);
       const modelRef: ModelRef = { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) };
+      if (!reserveCall()) {
+        u.status = "done";
+        inFlight.set(u.model, (inFlight.get(u.model) ?? 1) - 1);
+        inFlightGlobal -= 1;
+        return;
+      }
       const t0 = Date.now();
       let raw = "";
       try {
@@ -327,7 +346,6 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
       } catch (e) {
         const kind = classifyError(e);
         const ms = Date.now() - t0;
-        calls += 1;
         recordCall(u.model, ms, kind, 0);
         ledger.recordRejected({ file: u.file, line: u.chunk.startLine, title: "(sweep failed)", reason: `generate ${kind}`, model: u.model });
         failModel(u.model, kind);
@@ -351,7 +369,6 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
         return;
       }
       const ms = Date.now() - t0;
-      calls += 1;
       const sil = silSweeps.get(u.model) ?? { sweeps: 0, silent: 0 };
       sil.sweeps += 1;
 
@@ -452,7 +469,7 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
     await Promise.all(
       Array.from({ length: fiberCount }, () => (async () => {
         for (;;) {
-          if (Date.now() > wallDeadline) {
+          if (Date.now() > wallDeadline || budgetExceeded()) {
             partial = true;
             return;
           }
@@ -480,7 +497,7 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
         .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || b.confidence - a.confidence || (a.id < b.id ? -1 : 1))
         .slice(0, verifyBudget);
       for (const batch of chunkArr(cands, Math.max(1, globalMax))) {
-        if (Date.now() > wallDeadline) {
+        if (Date.now() > wallDeadline || budgetExceeded()) {
           partial = true;
           break;
         }
@@ -522,6 +539,7 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
       });
       const ref = parseModelKey(verifier);
       const modelRef: ModelRef = { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) };
+      if (!reserveCall()) return;
       log.emit({ type: "replicator.called", leadId: f.id, model: verifier });
       const t0 = Date.now();
       let raw = "";
@@ -529,14 +547,12 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
         raw = await withTimeout(deps.generate(modelRef, prompt, REPLICATOR_TIMEOUT_MS), REPLICATOR_TIMEOUT_MS, `verify:${f.id}`);
       } catch (e) {
         const kind = classifyError(e);
-        calls += 1;
         log.recordCall(verifier, Date.now() - t0, kind, 0);
         ledger.recordAttempt({ model: verifier, role: "verify", unit: f.id, outcome: kind, ms: Date.now() - t0, rawLen: 0 });
         failModel(verifier, kind);
         return;
       }
       const ms = Date.now() - t0;
-      calls += 1;
       const parsed = parseReplicator(raw);
       if (!parsed.output) {
         log.recordCall(verifier, ms, "json-invalid", raw.length);
@@ -659,6 +675,7 @@ export async function runJob(deps: JobDeps, repo: string, policy: JobPolicy): Pr
     const modelPerChunk: Record<string, string> = {};
     for (const c of cov) modelPerChunk[c.chunkHash] = c.model;
     const blindSpots: string[] = [];
+    if (models.length === 0) blindSpots.push("no models configured: nothing was swept");
     const fams = new Set(liveModels().concat(models).map(familyOf));
     if (fams.size <= 1 && models.length > 0) blindSpots.push("single-family pool: confirmations are single-model checks");
     blindSpots.push("files larger than 1MB are excluded from scope");
